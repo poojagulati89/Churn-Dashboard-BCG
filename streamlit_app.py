@@ -1,23 +1,3 @@
-"""
-Soft Churn + Shop Dashboard (updated per user spec)
-
-Key enforced behaviors:
-- Display churn probabilities as numeric percent (0..100) rounded to 3 decimals and sortable:
-    * "With Recency Churn Probability %"
-    * "Without Recency Churn %"
-- Keep internal probabilities as 0..1 for calculations (P_old, P_new)
-- Delta_prob renamed to "Delta Probability" and displayed as percent (0..100) rounded to 3 decimals
-- All displayed numeric columns rounded to 3 decimals
-- Recency_days canonical column used in simulations; UI label "Recency in days"
-- Use only Shop Code as identifier (no Retailer_Name in displays)
-- Top-N override removed (Top-N now only applies to filtered set)
-- Frequency checkbox mutually exclusive with manual customer input
-- RLV mapping: try shop_rlv_map.csv detection & highest-variance numeric column; if missing, set RLV_numeric = NaN and show explicit warning listing affected features
-- Models loaded from model/*.joblib and predict_proba used; model.feature_names_in_ checked in Diagnostics
-- Temporary debug block included (first 5 shops p_old/p_new & feature diffs)
-- No dummy data invented anywhere
-"""
-
 import os
 import io
 import re
@@ -25,6 +5,7 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import joblib
 
@@ -36,11 +17,12 @@ st.set_page_config(page_title="Soft Churn", layout="wide")
 MODEL_WITH_RECENCY = "model/rf_final_model_with_recency.joblib"
 MODEL_WITHOUT_RECENCY = "model/rf_final_model_without_recency.joblib"
 CANDIDATE_RFMV_FILES = [
+    "data/processed/feature_engineered_rlv.csv", # Primary data source
     "data/processed/RFMV_Clusters_Risk_with_FirstYear.csv",
     "data/processed/RFMV_Clusters_Risk.csv",
     "data/processed/RFMV.csv",
 ]
-TRANSACTION_FILE = "data/original/Qinet_transaction_data.csv"
+TRANSACTION_FILE = "Qinet_transaction_data.csv"
 RLV_MAP_FILE = "shop_rlv_map.csv"    # optional
 SHOP_NAME_MAP = "shop_name_map.csv"  # optional; not used in displays per spec
 
@@ -151,6 +133,29 @@ def compute_scores_if_missing(df):
             except Exception:
                 df[sc] = 0
     return df
+
+def recalculate_r_score_from_recency(recency_value, recency_series):
+    """
+    Recalculate R_Score based on a new recency value using the distribution from recency_series.
+    Lower recency = higher R_Score (5 is best, 1 is worst)
+    """
+    try:
+        # Get quintile boundaries from the original recency distribution
+        quintiles = recency_series.quantile([0.2, 0.4, 0.6, 0.8]).values
+        
+        # Assign R_Score based on where the new recency falls
+        if recency_value <= quintiles[0]:
+            return 5  # Best (most recent)
+        elif recency_value <= quintiles[1]:
+            return 4
+        elif recency_value <= quintiles[2]:
+            return 3
+        elif recency_value <= quintiles[3]:
+            return 2
+        else:
+            return 1  # Worst (least recent)
+    except Exception:
+        return 3  # Default to middle if calculation fails
 
 def find_best_rlv_column(rlv_df):
     """
@@ -273,6 +278,7 @@ fcols_with = model_with_bundle.get('feature_cols') if model_with_bundle else Non
 model_wo = model_wo_bundle['model'] if model_wo_bundle else None
 fcols_wo = model_wo_bundle.get('feature_cols') if model_wo_bundle else None
 
+# Prioritize feature_engineered_rlv.csv
 rfmv_path = find_file(CANDIDATE_RFMV_FILES)
 rfmv = load_csv(rfmv_path) if rfmv_path else pd.DataFrame()
 transactions = load_csv(TRANSACTION_FILE)
@@ -429,7 +435,8 @@ if page == "Soft Churn List":
         help="Metric used to rank shops when Top-N is applied (applies to filtered set)"
     )
     top_n = st.sidebar.number_input("Top N", min_value=1, max_value=1000, value=50, step=1, help="Number of shops for Top-N.")
-    margin_for_top = st.sidebar.slider("Margin for top-N approx profit", 0.0, 1.0, 0.3, 0.05, help="Used for ranking by estimated profit.")
+    margin_for_top_pct = st.sidebar.slider("Margin for top-N approx profit (%)", 0.0, 100.0, 30.0, 0.01, help="Used for ranking by estimated profit.")
+    margin_for_top = margin_for_top_pct / 100.0 # Convert to fraction
 
     st.sidebar.markdown("### Soft churn bounds")
     soft_lower = st.sidebar.slider("Soft churn lower bound (prob)", 0.0, 1.0, 0.3, 0.01, help="Lower bound for 'Soft Churn'.")
@@ -521,29 +528,33 @@ if page == "Soft Churn List":
     days_reduce = st.number_input("Days to reduce Recency by", min_value=0, max_value=365, value=7, step=1) if sim_mode.startswith("Reduce") else 0
     rscore_shift = st.slider("R_Score shift (bins)", -4, 4, 1) if sim_mode.startswith("Shift") else 0
 
-    use_freq_as_customers = st.checkbox("Use Frequency as estimated customers targeted (if available)", value=True, help="If checked, Frequency is used as the number of customers targeted.")
-    # If Frequency is checked, do not show manual input. If not checked, show manual (default empty handled as 100).
-    manual_customers = None
-    if not use_freq_as_customers:
-        manual_customers = st.number_input("Manual customers (used when Frequency not used)", min_value=1, max_value=1000000, value=100, step=1)
+    # Intervention Cost Calculation Method
+    intervention_cost_method = st.radio(
+        "Intervention Cost Calculation Method",
+        options=["Flat fee per shop", "Percentage of RLV"],
+        index=0,
+        help="Choose how the intervention cost is calculated."
+    )
 
-    intervention_cost = st.number_input("Intervention cost per customer ($)", min_value=0.0, max_value=10000.0, value=5.0, step=0.5)
+    intervention_cost_value = 0.0
+    if intervention_cost_method == "Flat fee per shop":
+        intervention_cost_value = st.number_input("Intervention cost per shop ($)", min_value=0.0, max_value=100000.0, value=500.0, step=10.0)
+    else: # Percentage of RLV
+        intervention_cost_value = st.number_input("Intervention cost as % of RLV", min_value=0.0, max_value=100.0, value=5.0, step=0.1) / 100.0 # Convert to fraction
+
     horizon_months = st.number_input("Horizon months to monetize retention", min_value=1, max_value=36, value=3, step=1)
-    margin = st.number_input("Margin fraction (0-1)", min_value=0.0, max_value=1.0, value=0.30, step=0.01)
+    margin_pct = st.slider("Profit margin (%)", 0.0, 100.0, 3.0, 0.01)
+    margin = margin_pct / 100.0 # Convert to fraction
 
     sims = []
     if sim_shops:
+        # Store original Recency distribution for R_Score recalculation
+        original_recency_series = df_sel['Recency_days'].dropna()
+        
         for shop in sim_shops:
             if shop not in df_sel['Shop Code'].values:
                 continue
             row = df_sel[df_sel['Shop Code'] == shop].iloc[0].copy()
-
-            # customers targeted selection logic
-            freq_val = pd.to_numeric(rfmv.loc[rfmv['Shop Code']==shop,'Frequency'].squeeze(), errors='coerce') if 'Frequency' in rfmv.columns else np.nan
-            if use_freq_as_customers and not pd.isna(freq_val) and float(freq_val) > 0:
-                customers_targeted = float(freq_val)
-            else:
-                customers_targeted = float(manual_customers or 0)
 
             # internal probs 0..1
             p_old_with = float(row.get('prob_with', np.nan)) if pd.notna(row.get('prob_with', np.nan)) else np.nan
@@ -559,12 +570,20 @@ if page == "Soft Churn List":
 
             # Create modified row for simulation
             mod = row.copy()
-            # canonical Recency_days usage
+            
+            # **FIX 1: When reducing Recency_days, recalculate R_Score**
             if sim_mode.startswith("Reduce") and 'Recency_days' in mod.index:
                 try:
-                    mod['Recency_days'] = max(0, float(mod['Recency_days']) - float(days_reduce))
-                except Exception:
+                    old_recency = float(mod['Recency_days'])
+                    new_recency = max(0, old_recency - float(days_reduce))
+                    mod['Recency_days'] = new_recency
+                    
+                    # Recalculate R_Score based on new Recency
+                    mod['R_Score'] = recalculate_r_score_from_recency(new_recency, original_recency_series)
+                except Exception as e:
+                    st.warning(f"Error recalculating R_Score for {shop}: {e}")
                     pass
+                    
             if sim_mode.startswith("Shift") and 'R_Score' in mod.index:
                 try:
                     newr = int(mod.get('R_Score', 0)) + int(rscore_shift)
@@ -604,12 +623,39 @@ if page == "Soft Churn List":
 
             # RLV numeric (may be NaN)
             rlv = float(row.get('RLV_numeric', np.nan)) if pd.notna(row.get('RLV_numeric', np.nan)) else np.nan
+            
+            # RLV To Date (YTD_RLV)
+            rlv_to_date = float(row.get('YTD_RLV', np.nan)) if pd.notna(row.get('YTD_RLV', np.nan)) else np.nan
+
+            # Expected RLV (No Intervention)
+            expected_rlv_no_intervention = float(row.get('Expected RLV', np.nan)) if pd.notna(row.get('Expected RLV', np.nan)) else np.nan
+
             delta_prob = max(0.0, (p_old - p_new)) if (not pd.isna(p_old) and not pd.isna(p_new)) else np.nan
 
-            expected_retained_revenue = (delta_prob * rlv * (horizon_months / 1.0)) if not pd.isna(delta_prob) and not pd.isna(rlv) else np.nan
+            # Expected Retained Revenue (With Intervention)
+            expected_retained_revenue = (expected_rlv_no_intervention * (delta_prob / (1 - p_old))) if (not pd.isna(expected_rlv_no_intervention) and not pd.isna(delta_prob) and (1 - p_old) != 0) else np.nan
+            
             expected_gross_profit = expected_retained_revenue * margin if not pd.isna(expected_retained_revenue) else np.nan
-            intervention_total = customers_targeted * intervention_cost
-            net_expected_profit = expected_gross_profit - intervention_total if not pd.isna(expected_gross_profit) else np.nan
+            
+            # Intervention Cost Calculation
+            intervention_total = 0.0
+            if intervention_cost_method == "Flat fee per shop":
+                intervention_total = intervention_cost_value
+            else: # Percentage of RLV
+                intervention_total = expected_rlv_no_intervention * intervention_cost_value if not pd.isna(expected_rlv_no_intervention) else np.nan
+
+            net_expected_profit = expected_gross_profit - intervention_total if not pd.isna(expected_gross_profit) and not pd.isna(intervention_total) else np.nan
+
+            # **FIX 2: Profitability Growth - use RLV To Date * margin as baseline**
+            current_net_income = rlv_to_date * margin if not pd.isna(rlv_to_date) else np.nan
+            profitability_growth = ((net_expected_profit - current_net_income) / current_net_income) if (not pd.isna(net_expected_profit) and not pd.isna(current_net_income) and current_net_income != 0) else np.nan
+
+            # Churn Reduction Effectiveness (Team KPIs)
+            churn_reduction_effectiveness = (expected_rlv_no_intervention * (delta_prob / p_old)) if (not pd.isna(expected_rlv_no_intervention) and not pd.isna(delta_prob) and p_old != 0) else np.nan
+
+            # Revenue Growth Rate (Lift) (CFO Reporting)
+            revenue_growth_rate_lift = (expected_rlv_no_intervention * (delta_prob / (1 - p_old))) if (not pd.isna(expected_rlv_no_intervention) and not pd.isna(delta_prob) and (1 - p_old) != 0) else np.nan
+
 
             sims.append({
                 'Shop Code': shop,
@@ -618,29 +664,61 @@ if page == "Soft Churn List":
                 'P_new': p_new,
                 # Delta Probability numeric 0..1
                 'Delta Probability': delta_prob,
-                'Customers_targeted': customers_targeted,
                 'RLV': rlv,
-                f'Expected_retained_revenue_{horizon_months}m': expected_retained_revenue,
-                'Expected_gross_profit': expected_gross_profit,
-                'Intervention_cost_total': intervention_total,
-                'Net_expected_profit': net_expected_profit
+                'RLV To Date': rlv_to_date,
+                'Expected RLV (No Intervention)': expected_rlv_no_intervention,
+                'Expected Retained Revenue (With Intervention)': expected_retained_revenue,
+                'Expected Gross Profit': expected_gross_profit,
+                'Intervention Cost Total': intervention_total,
+                'Net Expected Profit': net_expected_profit,
+                'Current Net Income': current_net_income,  # Added for debugging
+                'Profitability Growth': profitability_growth,
+                'Churn Reduction Effectiveness': churn_reduction_effectiveness,
+                'Revenue Growth Rate (Lift)': revenue_growth_rate_lift
             })
 
         sims_df = pd.DataFrame(sims)
         if not sims_df.empty:
             # Compute aggregate metrics (respect NaNs)
-            total_expected_gross = sims_df['Expected_gross_profit'].sum(min_count=1)
-            total_intervention_cost = sims_df['Intervention_cost_total'].sum(min_count=1)
-            total_net = sims_df['Net_expected_profit'].sum(min_count=1)
+            total_expected_gross = sims_df['Expected Gross Profit'].sum(min_count=1)
+            total_intervention_cost = sims_df['Intervention Cost Total'].sum(min_count=1)
+            total_net = sims_df['Net Expected Profit'].sum(min_count=1)
             total_rlv = sims_df['RLV'].sum(min_count=1) if 'RLV' in sims_df.columns else np.nan
-            uplift_pct = (total_expected_gross / total_rlv) if total_rlv and total_rlv > 0 else np.nan
+            
+            # Weighted averages for churn metrics
+            total_rlv_no_intervention = sims_df['Expected RLV (No Intervention)'].sum(min_count=1)
+
+            baseline_churn_prob_avg = (sims_df['P_old'] * sims_df['Expected RLV (No Intervention)']).sum(min_count=1) / total_rlv_no_intervention if total_rlv_no_intervention else np.nan
+            expected_churn_after_intervention_avg = (sims_df['P_new'] * sims_df['Expected RLV (No Intervention)']).sum(min_count=1) / total_rlv_no_intervention if total_rlv_no_intervention else np.nan
+            absolute_churn_reduction_avg = baseline_churn_prob_avg - expected_churn_after_intervention_avg
+            relative_churn_reduction_avg = (absolute_churn_reduction_avg / baseline_churn_prob_avg) if baseline_churn_prob_avg else np.nan
+
+            st.subheader("Overall Churn Metrics (Weighted by Expected RLV)")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Baseline Churn Probability", f"{pct_percent_number(baseline_churn_prob_avg, 3):.3f}%" if not pd.isna(baseline_churn_prob_avg) else "N/A")
+            col2.metric("Expected Churn After Intervention", f"{pct_percent_number(expected_churn_after_intervention_avg, 3):.3f}%" if not pd.isna(expected_churn_after_intervention_avg) else "N/A")
+            col3.metric("Absolute Churn Reduction", f"{pct_percent_number(absolute_churn_reduction_avg, 3):.3f} %" if not pd.isna(absolute_churn_reduction_avg) else "N/A")
+            col4.metric("Relative Churn Reduction", f"{pct_percent_number(relative_churn_reduction_avg, 3):.3f}%" if not pd.isna(relative_churn_reduction_avg) else "N/A")
+
 
             # Round and format aggregate metrics per spec (currency with 3 decimals)
             a1, a2, a3, a4 = st.columns([1.5,1.5,1.5,1.5])
-            a1.metric("Aggregate expected gross profit", fmt_currency(total_expected_gross, 3) if not pd.isna(total_expected_gross) else "N/A")
-            a2.metric("Aggregate intervention cost", fmt_currency(total_intervention_cost, 3) if not pd.isna(total_intervention_cost) else "N/A")
-            a3.metric("Aggregate net expected profit", fmt_currency(total_net, 3) if not pd.isna(total_net) else "N/A")
-            a4.metric("Estimated uplift vs total RLV", (f"{round(uplift_pct,3):.3%}" if not pd.isna(uplift_pct) else "N/A"))
+            a1.metric("Aggregate Expected Gross Profit", fmt_currency(total_expected_gross, 3) if not pd.isna(total_expected_gross) else "N/A")
+            a2.metric("Aggregate Intervention Cost", fmt_currency(total_intervention_cost, 3) if not pd.isna(total_intervention_cost) else "N/A")
+            a3.metric("Aggregate Net Expected Profit", fmt_currency(total_net, 3) if not pd.isna(total_net) else "N/A")
+            
+            # **FIX 2: Aggregate Profitability Growth calculation**
+            total_current_net_income = sims_df['Current Net Income'].sum(min_count=1)
+            total_profitability_growth = ((total_net - total_current_net_income) / total_current_net_income) if (not pd.isna(total_net) and not pd.isna(total_current_net_income) and total_current_net_income != 0) else np.nan
+            a4.metric("Aggregate Profitability Growth", f"{pct_percent_number(total_profitability_growth, 3):.3f}%" if not pd.isna(total_profitability_growth) else "N/A")
+
+            st.subheader("Financial Impact of Intervention")
+            col_fin1, col_fin2 = st.columns(2)
+            total_churn_reduction_effectiveness = sims_df['Churn Reduction Effectiveness'].sum(min_count=1)
+            total_revenue_growth_rate_lift = sims_df['Revenue Growth Rate (Lift)'].sum(min_count=1)
+            col_fin1.metric("Total Churn Reduction Effectiveness (Team KPIs)", fmt_currency(total_churn_reduction_effectiveness, 3) if not pd.isna(total_churn_reduction_effectiveness) else "N/A")
+            col_fin2.metric("Total Revenue Growth Rate (Lift) (CFO Reporting)", fmt_currency(total_revenue_growth_rate_lift, 3) if not pd.isna(total_revenue_growth_rate_lift) else "N/A")
+
 
             # Prepare display DataFrame: show Shop Code, numeric percent columns, Delta Probability as percent, numeric rounding to 3 decimals
             disp = sims_df.copy()
@@ -651,36 +729,131 @@ if page == "Soft Churn List":
             for c in ['With Recency Churn Probability %','New Probability % (for selected model)','Delta Probability']:
                 if c in disp.columns:
                     disp[c] = round_series_safe(disp[c], 3)
-            if 'Customers_targeted' in disp.columns:
-                disp['Customers_targeted'] = round_series_safe(disp['Customers_targeted'], 3)
+            
+            # Rename RLV and Revenue Metrics
+            disp = disp.rename(columns={
+                'RLV To Date': 'RLV To Date',
+                'Expected RLV (No Intervention)': 'Expected RLV (No Intervention)',
+                'Expected Retained Revenue (With Intervention)': 'Expected Retained Revenue (With Intervention)',
+                'Expected Gross Profit': 'Expected Gross Profit',
+                'Net Expected Profit': 'Net Expected Profit',
+                'Profitability Growth': 'Profitability Growth %',
+                'Churn Reduction Effectiveness': 'Churn Reduction Effectiveness',
+                'Revenue Growth Rate (Lift)': 'Revenue Growth Rate (Lift)'
+            })
+
             # Format currency columns for human-readable columns but keep numeric copies for sorting if needed
-            currency_cols = [f'Expected_retained_revenue_{horizon_months}m','Expected_gross_profit','Intervention_cost_total','Net_expected_profit']
+            currency_cols = [
+                'RLV To Date',
+                'Expected RLV (No Intervention)',
+                'Expected Retained Revenue (With Intervention)',
+                'Expected Gross Profit',
+                'Intervention Cost Total',
+                'Net Expected Profit',
+                'Churn Reduction Effectiveness',
+                'Revenue Growth Rate (Lift)'
+            ]
             for c in currency_cols:
                 if c in disp.columns:
                     disp[c + " (display)"] = disp[c].apply(lambda v: fmt_currency(v,3) if pd.notna(v) else '')
+            
+            # Format percentage columns
+            if 'Profitability Growth %' in disp.columns:
+                disp['Profitability Growth % (display)'] = disp['Profitability Growth %'].apply(lambda v: f"{pct_percent_number(v,3):.3f}%" if pd.notna(v) else '')
+
             # Columns ordering for display
-            display_order = ['Shop Code','With Recency Churn Probability %','New Probability % (for selected model)','Delta Probability','Customers_targeted','RLV'] + [c + " (display)" for c in currency_cols]
-            # Remove Retailer_Name usage per spec
+            display_order = [
+                'Shop Code',
+                'With Recency Churn Probability %',
+                'New Probability % (for selected model)',
+                'Delta Probability',
+                'RLV To Date (display)',
+                'Expected RLV (No Intervention) (display)',
+                'Expected Retained Revenue (With Intervention) (display)',
+                'Expected Gross Profit (display)',
+                'Intervention Cost Total (display)',
+                'Net Expected Profit (display)',
+                'Profitability Growth % (display)',
+                'Churn Reduction Effectiveness (display)',
+                'Revenue Growth Rate (Lift) (display)'
+            ]
             render_disp = disp[[c for c in display_order if c in disp.columns]].copy()
 
-            st.subheader("What‑If results")
+            st.subheader("What‑If results per Shop")
             if AGGRID_AVAILABLE:
-                # build a grid with numeric percent columns and numeric RLV for sorting
                 tmp_grid = render_disp.copy()
-                # ensure numeric RLV column exists (use underlying sims_df)
-                if 'RLV' in tmp_grid.columns:
-                    tmp_grid['RLV_numeric'] = tmp_grid['RLV']  # keep numeric
                 grid_resp2 = render_aggrid_with_tooltips_and_numeric(tmp_grid, height=320, enable_selection=False)
             else:
                 st.dataframe(render_disp, height=320)
 
-            # Chart (use numeric underlying columns from sims_df)
-            # melt only existing numeric columns
-            melt_cols = [c for c in ['Expected_gross_profit','Intervention_cost_total','Net_expected_profit'] if c in sims_df.columns]
-            if melt_cols:
-                vis_df = sims_df.melt(id_vars=['Shop Code'], value_vars=melt_cols, var_name='Metric', value_name='USD')
-                fig_bar = px.bar(vis_df, x='Shop Code', y='USD', color='Metric', barmode='group', title='Profit vs cost per shop')
-                st.plotly_chart(fig_bar, use_container_width=True)
+            # Churn Reduction Visualizations in Tabs
+            st.subheader("Churn Reduction Visualizations")
+            tab1, tab2, tab3 = st.tabs(["Side-by-Side Bar Chart", "Waterfall Chart", "Scatter Plot"])
+
+            with tab1:
+                st.write("### Churn Reduction: Side-by-Side Bar Chart")
+                bar_chart_df = sims_df[['Shop Code', 'P_old', 'P_new']].copy()
+                bar_chart_df['P_old'] = bar_chart_df['P_old'] * 100
+                bar_chart_df['P_new'] = bar_chart_df['P_new'] * 100
+                bar_chart_df_melted = bar_chart_df.melt(id_vars='Shop Code', var_name='Probability Type', value_name='Churn Probability %')
+                fig_bar_churn = px.bar(bar_chart_df_melted, x='Shop Code', y='Churn Probability %', color='Probability Type', barmode='group',
+                                        title='Baseline vs. Expected Churn Probability per Shop')
+                st.plotly_chart(fig_bar_churn, use_container_width=True)
+
+            with tab2:
+                st.write("### Churn Reduction: Waterfall Chart")
+                waterfall_df = sims_df[['Shop Code', 'P_old', 'P_new']].copy()
+                waterfall_df['P_old'] = waterfall_df['P_old'] * 100
+                waterfall_df['P_new'] = waterfall_df['P_new'] * 100
+                
+                fig_waterfall = go.Figure()
+                for index, row in waterfall_df.iterrows():
+                    shop_code = row['Shop Code']
+                    p_old = row['P_old']
+                    p_new = row['P_new']
+                    delta = p_old - p_new
+
+                    fig_waterfall.add_trace(go.Waterfall(
+                        name=shop_code,
+                        orientation="v",
+                        measure=["absolute", "relative"],
+                        x=[f"{shop_code} - Baseline", f"{shop_code} - Reduction"],
+                        textposition="outside",
+                        text=[f"{p_old:.2f}%", f"{-delta:.2f}%"],
+                        y=[p_old, -delta],
+                        connector={"line":{"color":"rgb(63, 63, 63)"}},
+                    ))
+                fig_waterfall.update_layout(title_text="Churn Probability Reduction per Shop", showlegend=True)
+                st.plotly_chart(fig_waterfall, use_container_width=True)
+
+            with tab3:
+                st.write("### Churn Reduction: Scatter Plot")
+                scatter_df = sims_df[['Shop Code', 'P_old', 'P_new', 'Expected RLV (No Intervention)']].copy()
+                scatter_df['P_old'] = scatter_df['P_old'] * 100
+                scatter_df['P_new'] = scatter_df['P_new'] * 100
+                scatter_df['Absolute Churn Reduction'] = scatter_df['P_old'] - scatter_df['P_new']
+                fig_scatter = px.scatter(scatter_df, x='P_old', y='Absolute Churn Reduction', size='Expected RLV (No Intervention)', color='Shop Code',
+                                        hover_name='Shop Code', title='Absolute Churn Reduction vs. Baseline Churn Probability',
+                                        labels={'P_old': 'Baseline Churn Probability (%)', 'Absolute Churn Reduction': 'Absolute Churn Reduction (pp)'})
+                st.plotly_chart(fig_scatter, use_container_width=True)
+
+
+            # Updated Profit vs Cost Chart
+            st.subheader("Profit vs Cost per Shop")
+            profit_cost_df = sims_df[['Shop Code', 'Expected Retained Revenue (With Intervention)', 'Intervention Cost Total', 'Expected Gross Profit', 'Net Expected Profit']].copy()
+            profit_cost_df = profit_cost_df.rename(columns={
+                'Expected Retained Revenue (With Intervention)': 'Revenue',
+                'Intervention Cost Total': 'Intervention Cost',
+                'Expected Gross Profit': 'Gross Profit',
+                'Net Expected Profit': 'Net Profit'
+            })
+            
+            melt_cols_profit = [c for c in ['Revenue','Intervention Cost','Gross Profit','Net Profit'] if c in profit_cost_df.columns]
+            if melt_cols_profit:
+                vis_df_profit = profit_cost_df.melt(id_vars=['Shop Code'], value_vars=melt_cols_profit, var_name='Metric', value_name='USD')
+                fig_bar_profit = px.bar(vis_df_profit, x='Shop Code', y='USD', color='Metric', barmode='group', title='Revenue, Cost, Gross Profit, and Net Profit per Shop')
+                st.plotly_chart(fig_bar_profit, use_container_width=True)
+
 
             # Exports
             csv_buf = sims_df.to_csv(index=False).encode('utf-8')
@@ -745,56 +918,93 @@ elif page == "Shop Dashboard":
     st.write("Revenue & profit over time (Shop-level).")
 
     if transactions.empty:
-        st.warning("Transactions not found.")
+        st.warning("Transactions not found. Please ensure the transaction file is available.")
     else:
         tx = transactions.copy()
         tx.columns = [re.sub(r'^\ufeff','',c).strip() for c in tx.columns]
-        date_candidates = [c for c in tx.columns if re.search(r'date', c, re.I)]
-        shop_candidates = [c for c in tx.columns if re.search(r'shop', c, re.I)]
-        sales_candidates = [c for c in tx.columns if re.search(r'sales|revenue|amount|total', c, re.I)]
+        
+        # **FIX 3: Improved column detection**
+        date_candidates = [c for c in tx.columns if re.search(r'date|time|dt', c, re.I)]
+        shop_candidates = [c for c in tx.columns if re.search(r'shop|store|retailer|code', c, re.I)]
+        sales_candidates = [c for c in tx.columns if re.search(r'sales|revenue|amount|total|price', c, re.I)]
 
-        st.sidebar.markdown("Transaction column autodetect")
-        st.sidebar.write("Date cols:", date_candidates)
-        st.sidebar.write("Shop cols:", shop_candidates)
-        st.sidebar.write("Sales-like cols:", sales_candidates)
+        st.sidebar.markdown("### Transaction Column Detection")
+        st.sidebar.write("📅 Date cols found:", date_candidates if date_candidates else "None")
+        st.sidebar.write("🏪 Shop cols found:", shop_candidates if shop_candidates else "None")
+        st.sidebar.write("💰 Sales cols found:", sales_candidates if sales_candidates else "None")
 
-        date_col = st.sidebar.selectbox("Date column", options=(date_candidates if date_candidates else tx.columns.tolist()), index=0)
-        shop_col = st.sidebar.selectbox("Shop column", options=(shop_candidates if shop_candidates else tx.columns.tolist()), index=0)
-        sales_col = st.sidebar.selectbox("Sales column", options=(sales_candidates if sales_candidates else tx.columns.tolist()), index=0)
+        # Provide defaults or let user select
+        if not date_candidates:
+            st.error("❌ No date column detected in transactions. Please check your data.")
+            st.stop()
+        if not shop_candidates:
+            st.error("❌ No shop column detected in transactions. Please check your data.")
+            st.stop()
+        if not sales_candidates:
+            st.error("❌ No sales column detected in transactions. Please check your data.")
+            st.stop()
+
+        date_col = st.sidebar.selectbox("📅 Date column", options=date_candidates, index=0)
+        shop_col = st.sidebar.selectbox("🏪 Shop column", options=shop_candidates, index=0)
+        sales_col = st.sidebar.selectbox("💰 Sales column", options=sales_candidates, index=0)
 
         # Shop Dashboard Top-N controls (no override)
         st.sidebar.markdown("### Shop Dashboard Top‑N")
         shop_topn_mode = st.sidebar.selectbox("Top N mode (shops dashboard)", options=['None','Top churners (by prob)','Top RLV','Top estimated profit'], index=0, help="Top-N ranking method for this page (applies to filtered set)")
         shop_top_n = st.sidebar.number_input("Top N (shops dashboard)", min_value=1, max_value=1000, value=50, step=1)
 
+        # **FIX 4: Improved date parsing**
         try:
             tx[date_col] = pd.to_datetime(tx[date_col], errors='coerce')
-        except Exception:
-            tx[date_col] = pd.to_datetime(tx[date_col].astype(str), errors='coerce')
+            invalid_dates = tx[date_col].isna().sum()
+            if invalid_dates > 0:
+                st.warning(f"⚠️ {invalid_dates} rows have invalid dates and will be excluded.")
+        except Exception as e:
+            st.error(f"❌ Error parsing date column '{date_col}': {e}")
+            st.stop()
 
         tx = tx.dropna(subset=[date_col]).copy()
+        
+        if tx.empty:
+            st.error("❌ No valid transactions after date parsing. Please check your date column.")
+            st.stop()
+        
         tx[shop_col] = tx[shop_col].astype(str)
+        
+        # **FIX 5: Improved sales column cleaning**
         def clean_currency_series(s: pd.Series):
             s = s.fillna("").astype(str).str.strip()
+            # Remove currency symbols, commas, and other non-numeric characters except decimal point and minus
             cleaned = s.str.replace(r'[^\d\.\-]', '', regex=True).replace('', '0')
-            return pd.to_numeric(cleaned, errors='coerce').fillna(0.0)
+            numeric = pd.to_numeric(cleaned, errors='coerce').fillna(0.0)
+            return numeric
+        
         tx[sales_col] = clean_currency_series(tx[sales_col])
+        
+        # Show data quality info
+        st.sidebar.markdown("### Data Quality")
+        st.sidebar.write(f"✅ Valid transactions: {len(tx):,}")
+        st.sidebar.write(f"📅 Date range: {tx[date_col].min().date()} to {tx[date_col].max().date()}")
+        st.sidebar.write(f"🏪 Unique shops: {tx[shop_col].nunique():,}")
+        st.sidebar.write(f"💰 Total sales: {fmt_currency(tx[sales_col].sum(), 2)}")
 
         # Basic shop-level metrics for Top-N computation (use rfmv)
         shop_metrics = rfmv[['Shop Code','RLV_numeric','Segment']].copy()
         # merge probs computed earlier if present
         if 'prob_with' in rfmv.columns:
             shop_metrics = shop_metrics.merge(rfmv[['Shop Code','prob_with','prob_wo']], on='Shop Code', how='left')
-        approx_margin = 0.3
+        approx_margin_pct = st.sidebar.slider("Profit margin for Top-N approx profit (%)", 0.0, 100.0, 3.0, 0.01)
+        approx_margin = approx_margin_pct / 100.0
         shop_metrics['approx_profit'] = shop_metrics['RLV_numeric'] * approx_margin
 
         shops = sorted(tx[shop_col].unique().tolist())
 
-        sel_shops = st.multiselect("Select shops (or leave empty for all)", options=shops, default=(shops[:3] if shops else []))
+        sel_shops = st.multiselect("🏪 Select shops (or leave empty for all)", options=shops, default=(shops[:3] if len(shops) >= 3 else shops))
         min_date = tx[date_col].min().date()
         max_date = tx[date_col].max().date()
-        date_range = st.slider("Date range", min_value=min_date, max_value=max_date, value=(min_date, max_date))
-        margin_user = st.slider("Profit margin (0-1)", 0.0, 1.0, 0.30, 0.01)
+        date_range = st.slider("📅 Date range", min_value=min_date, max_value=max_date, value=(min_date, max_date))
+        margin_user_pct = st.slider("💰 Profit margin (%)", 0.0, 100.0, 3.0, 0.01)
+        margin_user = margin_user_pct / 100.0
 
         shops_df = shop_metrics.copy()
         if sel_shops:
@@ -812,54 +1022,79 @@ elif page == "Shop Dashboard":
                 sel_shops = shops_df['Shop Code'].tolist()
 
         if not sel_shops:
-            st.info("Pick shops or use Top-N controls to select shops.")
+            st.info("ℹ️ Pick shops or use Top-N controls to select shops.")
         else:
-            filt = tx[(tx[shop_col].isin(sel_shops)) & (tx[date_col].dt.date >= date_range[0]) & (tx[date_col].dt.date <= date_range[1])].copy()
+            # **FIX 6: Better filtering and error handling**
+            filt = tx[(tx[shop_col].isin(sel_shops)) & 
+                     (tx[date_col].dt.date >= date_range[0]) & 
+                     (tx[date_col].dt.date <= date_range[1])].copy()
+            
             if filt.empty:
-                st.warning("No transactions for the selected shops in date range.")
+                st.warning(f"⚠️ No transactions found for the selected shops in date range {date_range[0]} to {date_range[1]}.")
+                st.info("Try adjusting the date range or selecting different shops.")
             else:
+                st.success(f"✅ Found {len(filt):,} transactions for {len(sel_shops)} shop(s)")
+                
+                # **FIX 7: Improved aggregation**
                 filt['YearMonth'] = filt[date_col].dt.to_period('M').dt.to_timestamp()
                 monthly = filt.groupby('YearMonth')[sales_col].sum().reset_index().rename(columns={sales_col:'Revenue'}).sort_values('YearMonth')
                 monthly['Profit'] = monthly['Revenue'] * float(margin_user)
 
-                st.header(f"Revenue & Profit — Shops: {', '.join(sel_shops)}")
-                fig = px.line(monthly, x='YearMonth', y=['Revenue','Profit'], labels={'value':'Amount','YearMonth':'Month','variable':'Metric'})
-                fig.update_layout(height=420, margin=dict(l=40,r=40,t=40,b=40))
+                st.header(f"📊 Revenue & Profit — Shops: {', '.join(sel_shops[:5])}{' ...' if len(sel_shops) > 5 else ''}")
+                
+                # **FIX 8: Better visualization**
+                fig = px.line(monthly, x='YearMonth', y=['Revenue','Profit'], 
+                             labels={'value':'Amount ($)','YearMonth':'Month','variable':'Metric'},
+                             title=f'Monthly Revenue and Profit Trend')
+                fig.update_layout(height=420, margin=dict(l=40,r=40,t=60,b=40), hovermode='x unified')
+                fig.update_traces(mode='lines+markers')
                 st.plotly_chart(fig, use_container_width=True)
 
+                # **FIX 9: Better metrics display**
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
                 last_rev = float(monthly.iloc[-1]['Revenue'])
                 last_profit = float(monthly.iloc[-1]['Profit'])
-                st.metric("Latest month revenue (combined)", fmt_currency(last_rev,3))
-                st.metric("Latest month profit (combined)", fmt_currency(last_profit,3))
+                total_rev = float(monthly['Revenue'].sum())
+                total_profit = float(monthly['Profit'].sum())
+                
+                col_m1.metric("Latest Month Revenue", fmt_currency(last_rev,2))
+                col_m2.metric("Latest Month Profit", fmt_currency(last_profit,2))
+                col_m3.metric("Total Revenue (Period)", fmt_currency(total_rev,2))
+                col_m4.metric("Total Profit (Period)", fmt_currency(total_profit,2))
 
+                # **FIX 10: Improved table display**
+                st.subheader("📋 Monthly Revenue per Shop (Table)")
                 pivot = filt.groupby(['YearMonth', shop_col])[sales_col].sum().reset_index()
                 pivoted = pivot.pivot(index='YearMonth', columns=shop_col, values=sales_col).fillna(0).sort_index().reset_index().rename(columns={'YearMonth':'Month'})
                 display_df = pivoted.copy()
                 numeric_cols = [c for c in display_df.columns if c != 'Month']
+                
+                # Round numeric columns
                 for c in numeric_cols:
-                    display_df[c] = display_df[c].apply(lambda v: round(float(v),3))
+                    display_df[c] = display_df[c].apply(lambda v: round(float(v),2))
+                
+                # Create view with formatted currency
                 view_df = display_df.copy()
                 for c in numeric_cols:
-                    view_df[c] = view_df[c].apply(lambda v: fmt_currency(v,3))
+                    view_df[c] = view_df[c].apply(lambda v: fmt_currency(v,2))
 
-                st.subheader("Monthly revenue per shop (table)")
                 if AGGRID_AVAILABLE:
-                    AgGrid(view_df, fit_columns_on_grid_load=True, enable_enterprise_modules=False)
+                    AgGrid(view_df, fit_columns_on_grid_load=True, enable_enterprise_modules=False, height=400)
                 else:
-                    st.dataframe(view_df, height=360)
+                    st.dataframe(view_df, height=400, use_container_width=True)
 
                 # Exports
-                st.download_button("Download CSV", data=display_df.to_csv(index=False).encode('utf-8'), file_name="shop_monthly_revenue.csv", mime="text/csv")
+                st.download_button("📥 Download CSV", data=display_df.to_csv(index=False).encode('utf-8'), file_name="shop_monthly_revenue.csv", mime="text/csv")
                 towrite = io.BytesIO()
                 with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
                     display_df.to_excel(writer, index=False, sheet_name='MonthlyRevenue')
-                st.download_button("Download Excel", data=towrite.getvalue(), file_name="shop_monthly_revenue.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button("📥 Download Excel", data=towrite.getvalue(), file_name="shop_monthly_revenue.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # -------------------------
 # Page: Diagnostics
 # -------------------------
 elif page == "Diagnostics":
-    st.title("Diagnostics")
+    st.title("🔍 Diagnostics")
     shop_list = sorted(rfmv['Shop Code'].unique().tolist())
     dbg_shop = st.selectbox("Pick shop to inspect", options=shop_list)
     if dbg_shop:
@@ -907,23 +1142,30 @@ elif page == "Diagnostics":
         else:
             st.info("No WITHOUT model available or no features prepared.")
 
-        # Temporary debug: show p_old/p_new and feature diffs for first 5 shops (remove later)
-        st.subheader("DEBUG: first 5 shops - p_old/p_new & feature diffs (temporary)")
-        sample_shops = rfmv['Shop Code'].head(5).tolist()
-        dbg_rows = []
-        for s in sample_shops:
-            r = rfmv[rfmv['Shop Code']==s].iloc[0]
-            Xw_s = prepare_X(r.to_frame().T, fcols_with) if model_with else pd.DataFrame()
-            Xwo_s = prepare_X(r.to_frame().T, fcols_wo) if model_wo else pd.DataFrame()
-            p_w = float(predict_probs(model_with, Xw_s)[0]) if model_with and not Xw_s.empty else np.nan
-            p_wo = float(predict_probs(model_wo, Xwo_s)[0]) if model_wo and not Xwo_s.empty else np.nan
-            dbg_rows.append({
-                "Shop Code": s,
-                "p_with": p_w,
-                "p_wo": p_wo,
-                "Recency_days": r.get('Recency_days', np.nan),
-                "R_Score": r.get('R_Score', np.nan)
-            })
-        st.table(pd.DataFrame(dbg_rows).fillna("N/A"))
+        # Debug: R_Score recalculation test
+        st.subheader("🧪 R_Score Recalculation Test")
+        if 'Recency_days' in row and pd.notna(row['Recency_days']):
+            original_recency = float(row['Recency_days'])
+            original_r_score = int(row.get('R_Score', 0))
+            
+            test_reductions = [7, 14, 30, 60]
+            recalc_results = []
+            
+            recency_series = rfmv['Recency_days'].dropna()
+            
+            for reduction in test_reductions:
+                new_recency = max(0, original_recency - reduction)
+                new_r_score = recalculate_r_score_from_recency(new_recency, recency_series)
+                recalc_results.append({
+                    "Days Reduced": reduction,
+                    "New Recency": new_recency,
+                    "New R_Score": new_r_score,
+                    "R_Score Change": new_r_score - original_r_score
+                })
+            
+            st.write(f"**Original:** Recency = {original_recency:.1f} days, R_Score = {original_r_score}")
+            st.table(pd.DataFrame(recalc_results))
+        else:
+            st.info("Recency_days not available for this shop")
 
 # End of app
